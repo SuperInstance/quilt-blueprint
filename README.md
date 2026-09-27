@@ -59,6 +59,7 @@ The exported chain verifies through `quilt_doctor/substrate.py`'s own
 ```
 node tools/wal-export.mjs schema.graphql -o receipts.wal.jsonl
 node tests/test_wal_export.mjs   # 18 checks, incl. the live doctor receipt
+node tests/test_wal_row_shape.mjs  # 12 checks — independent row-shape pin (own hash/canonical code)
 ```
 
 ## Where this sits in the stack
