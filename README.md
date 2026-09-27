@@ -46,6 +46,21 @@ order statistics and must never merge content.
 3. No varlen field may silently occupy fixed offset space.
 4. Every layout carries its axioms: idempotence, commutativity, associativity.
 
+## Receipts join the fleet WAL
+
+`tools/wal-export.mjs` re-anchors every compile receipt into the fleet
+five-opcode quilt WAL (BIND genesis / LINK per type×lang receipt / VIEW summary,
+fnv1a-64 hash chain, genesis prev `0×16`). Canonical producer of the spine:
+[SuperInstance/git-agent](https://github.com/SuperInstance/git-agent) PR #1
+`quilt_emit`; exporter pattern: SuperInstance/pong-quilt R36 wal-export (PR #46).
+The exported chain verifies through `quilt_doctor/substrate.py`'s own
+`QuiltSubstrate.verify()` — cross-tool, not a mock.
+
+```
+node tools/wal-export.mjs schema.graphql -o receipts.wal.jsonl
+node tests/test_wal_export.mjs   # 18 checks, incl. the live doctor receipt
+```
+
 ## Where this sits in the stack
 
 This is Layer 1 of the blueprint→metal pipeline. The full-stack deep-research
