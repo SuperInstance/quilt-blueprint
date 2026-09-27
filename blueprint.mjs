@@ -261,6 +261,130 @@ ${body}
 #pragma pack(pop)
 ${accessors}`;
   }
+  if (lang === "rust") {
+    const rt = { i64: "i64", u64: "u64", f32: "f32", u8: "u8", u32: "u32" };
+    const ra = { i64: 8, u64: 8, f32: 4, u8: 1, u32: 4 };
+    const tie = tieBreak(L);
+    const { plan, words } = structPlan(L);
+    const varlen = plan.filter(e => e.kind === "varlen");
+    const fixed = plan.filter(e => e.kind !== "varlen");
+
+    const fieldLines = fixed.map(e =>
+      e.kind === "word"
+        ? `    pub ${e.word.name}: u64, // offset ${e.word.offset}, size 8, align 8 — #[repr(C)] packed bits (LSB-first): ${wordBitComment(e.word)}`
+        : `    pub ${e.field.name}: ${rt[e.field.ctype] || "u32"}, // offset ${e.field.offset}, size ${e.field.size}, align ${ra[e.field.ctype] || 4} — #[repr(C)] natural alignment`);
+    if (varlen.length) {
+      fieldLines.push(`    // --- varlen reference block: appended AFTER the fixed-offset block ---`);
+      for (const e of varlen) {
+        fieldLines.push(`    pub ${e.field.name}: StrRef, // (u32 offset, u32 len) into the external blob arena — string bytes never inline in the fixed block`);
+      }
+    }
+
+    const rustJoinArm = f => {
+      const s = `self.${f.name}`, o = `other.${f.name}`;
+      if (f.join === "max" && f.ctype === "f32")
+        return `            // @join(max) on f32: no Ord — IEEE-754 max (NaN-ignoring), mirrors zig @max\n            ${f.name}: ${s}.max(${o}),`;
+      if (f.join === "max")
+        return `            // @join(max): semilattice merge via Ord::max\n            ${f.name}: Ord::max(${s}, ${o}),`;
+      if (f.join === "xor")
+        return `            // @join(xor): FINGERPRINT CLASS ONLY — destroys order statistics; flag, never content\n            ${f.name}: ${s} ^ ${o},`;
+      if (f.join === "lww")
+        return `            // @join(lww): last-writer-wins, tie-broken by @primary field '${tie.name}'${tie.declared ? "" : " (none declared — fallback: first fixed field)"}\n            ${f.name}: if self.${tie.name} >= other.${tie.name} { ${s} } else { ${o} },`;
+      return `            // not join-annotated: inherited from self; document or annotate\n            ${f.name}: ${s},`;
+    };
+    const ctorArms = fixed.filter(e => e.kind === "field").map(e => rustJoinArm(e.field));
+    for (const e of varlen) {
+      ctorArms.push(`            // varlen: arena reference inherited from self; arena bytes merge at a higher layer`);
+      ctorArms.push(`            ${e.field.name}: self.${e.field.name},`);
+    }
+
+    const accessors = [];
+    const packedApplies = [];
+    for (const w of words) for (const f of w.fields) {
+      const mask = hex64(maskOf(f.bit_width)), keep = hex64(keepMask(f.bit_offset, f.bit_width));
+      accessors.push(
+`    /// packed bitfield '${f.name}' — ${w.name} bits [${f.bit_offset}..${f.bit_offset + f.bit_width}) — LSB-first
+    pub fn get_${f.name}(&self) -> u64 {
+        (self.${w.name} >> ${f.bit_offset}) & ${mask}
+    }
+    /// set via mask: keep = ${keep}, insert = (v & ${mask}) << ${f.bit_offset}
+    pub fn set_${f.name}(&mut self, v: u64) {
+        self.${w.name} = (self.${w.name} & ${keep}) | ((v & ${mask}) << ${f.bit_offset});
+    }`);
+      const gs = `self.get_${f.name}()`, go = `other.get_${f.name}()`;
+      let expr, note;
+      if (f.join === "max") { expr = `Ord::max(${gs}, ${go})`; note = "@join(max) via bitfield accessors"; }
+      else if (f.join === "xor") { expr = `${gs} ^ ${go}`; note = "@join(xor): FINGERPRINT CLASS ONLY — destroys order statistics; flag, never content"; }
+      else if (f.join === "lww") { expr = `if self.${tie.name} >= other.${tie.name} { ${gs} } else { ${go} }`; note = `@join(lww) tie-broken by @primary field '${tie.name}'`; }
+      else { expr = gs; note = "not join-annotated: inherited from self; document or annotate"; }
+      packedApplies.push(`        out.set_${f.name}(${expr}); // ${note}`);
+    }
+
+    const joinBody = words.length
+? `        let mut out = ${type.name} {
+${ctorArms.join("\n")}
+${words.map(w => `            ${w.name}: 0, // packed bitfields merged via set_* below`).join("\n")}
+        };
+${packedApplies.join("\n")}
+        out`
+: `        ${type.name} {
+${ctorArms.join("\n")}
+        }`;
+
+    const folds = [];
+    for (const e of fixed) {
+      if (e.kind === "word") folds.push(`self.${e.word.name}`);
+      else if (e.field.ctype === "f32") folds.push(`self.${e.field.name}.to_bits() as u64`);
+      else if (e.field.ctype === "u64") folds.push(`self.${e.field.name}`);
+      else folds.push(`self.${e.field.name} as u64`);
+    }
+    for (const e of varlen) {
+      folds.push(`(self.${e.field.name}.offset as u64) | ((self.${e.field.name}.len as u64) << 32)`);
+    }
+    const foldLines = folds.map(w => `        h = (h.rotate_left(5) ^ (${w})).wrapping_mul(K);`).join("\n");
+
+    const strRefBlock = varlen.length ? `
+/// Varlen string reference — (u32 offset, u32 len) into an external blob arena.
+/// The string bytes are NEVER inline in the fixed block; only this reference
+/// is, appended after the fixed-offset block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrRef {
+    pub offset: u32,
+    pub len: u32,
+}
+` : "";
+
+    return `// generated by quilt-blueprint — receipt ${receipt(type, "rust")}
+// join axioms: idempotence, commutativity, associativity (semilattice)
+// fingerprint_fast is receipt-grade integrity, NOT a security boundary
+${strRefBlock}
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ${type.name} {
+${fieldLines.join("\n")}
+}
+
+impl ${type.name} {
+${accessors.length ? accessors.join("\n") + "\n" : ""}
+    /// Pure join (⊔). Monotonic inflation; convergence terminates at ceiling.
+    pub fn join(&self, other: &${type.name}) -> ${type.name} {
+${joinBody}
+    }
+
+    /// fxhash-style fast non-crypto hash over the fixed block.
+    /// receipt-grade integrity, NOT a security boundary.
+    /// Field words only (padding never hashed); StrRef folds (offset, len),
+    /// not the arena bytes behind them.
+    pub fn fingerprint_fast(&self) -> u64 {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h: u64 = 0;
+${foldLines}
+        h
+    }
+}
+`;
+  }
   throw new Error(`unknown lang ${lang}`);
 }
 
