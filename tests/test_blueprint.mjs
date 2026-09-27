@@ -94,7 +94,7 @@ check("rust StrRef documented as arena ref, never inline", /external blob arena[
 check("no inline asm in rust emitter", !/__asm__|asm!|asm volatile/.test(rust));
 
 // --- 11. rust lww: tie-break on the @primary field --------------------------
-const lwwType = parseSDL("type LwwRec { rev: Int! @primary tag: Int! @join(lww) }")[0];
+const lwwType = parseSDL("type LwwRec {\n rev: Int! @primary\n tag: Int! @join(lww)\n }")[0];
 const rustLww = tryEmit(lwwType, "rust");
 check("rust lww compares on @primary field", /if self\.rev >= other\.rev \{ self\.tag \} else \{ other\.tag \}/.test(rustLww));
 check("rust lww arm documents tie-break field", /tie-broken by @primary/.test(rustLww));
@@ -123,15 +123,15 @@ check("struct size rounds to max align", PL.size === 24);
 const pzig = tryEmit(packedType, "zig");
 check("zig emits u64 word storage", /word0: u64/.test(pzig) && /word1: u64/.test(pzig));
 check("zig getter mask LSB-first", /get_a[\s\S]*?\(self\.word0 >> 0\) & 0xffffffffffff/.test(pzig));
-check("zig setter clears keep-mask then ors", /set_c[\s\S]*?\(self\.word1 & 0xffffff0fffffffff\) \| \(\(v & 0xf\) << 32\)/.test(pzig));
+check("zig setter clears keep-mask then ors", /set_c[\s\S]*?\(self\.word1 & 0xfffffff0ffffffff\) \| \(\(v & 0xf\) << 32\)/.test(pzig));
 const pc = tryEmit(packedType, "c");
 check("c emits u64 word storage", /uint64_t word0/.test(pc));
 check("c getter renders mask", /PackedRec_get_a[\s\S]*?>> 0\) & 0xffffffffffffull/.test(pc));
-check("c setter renders keep-mask", /PackedRec_set_c[\s\S]*?& 0xffffff0fffffffffull/.test(pc));
+check("c setter renders keep-mask", /PackedRec_set_c[\s\S]*?& 0xfffffff0ffffffffull/.test(pc));
 const prust = tryEmit(packedType, "rust");
 check("rust emits u64 word storage", /pub word0: u64/.test(prust));
 check("rust getter renders mask", /fn get_a\(&self\) -> u64[\s\S]*?\(self\.word0 >> 0\) & 0xffffffffffff/.test(prust));
-check("rust setter renders keep-mask", /fn set_c\(&mut self, v: u64\)[\s\S]*?\(self\.word1 & 0xffffff0fffffffff\) \| \(\(v & 0xf\) << 32\)/.test(prust));
+check("rust setter renders keep-mask", /fn set_c\(&mut self, v: u64\)[\s\S]*?\(self\.word1 & 0xfffffff0ffffffff\) \| \(\(v & 0xf\) << 32\)/.test(prust));
 
 // --- 14. receipt parity: one canonical layout hash across langs -------------
 check("receipt rust == zig for plain schema", receipt(types[0], "rust") === receipt(types[0], "zig"));
