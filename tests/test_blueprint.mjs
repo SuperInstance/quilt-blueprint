@@ -77,5 +77,68 @@ const two = parseSDL("type A { s: Int! @join(max) }\ntype B { tag: Int! @join(lw
 check("multi-type schema parses", two.length === 2);
 check("lww is a known join", two[1].fields[0].join === "lww");
 
+// --- 10. rust emitter: #[repr(C)], honest joins, arena varlen refs ----------
+const tryEmit = (t, lang) => { try { return emit(t, lang); } catch (e) { return `/* EMIT FAILED: ${e.message} */`; } };
+const rust = tryEmit(types[0], "rust");
+check("rust emits #[repr(C)] struct", /#\[repr\(C\)\][\s\S]*?pub struct CellState\b/.test(rust));
+check("rust emits fingerprint_fast(&self) -> u64", /fn fingerprint_fast\(&self\) -> u64/.test(rust));
+check("rust fingerprint is fxhash-style non-crypto", /fxhash/i.test(rust) && /rotate_left\(5\)/.test(rust));
+check("rust fingerprint documented receipt-grade, NOT security boundary", /receipt-grade integrity, NOT a security boundary/.test(rust));
+check("rust does NOT claim cryptographic anything", !/cryptographic/i.test(rust));
+check("rust join uses Ord::max on seq", /Ord::max\(self\.seq, other\.seq\)/.test(rust));
+check("rust join uses ^ for xor fingerprint", /self\.fingerprint \^ other\.fingerprint/.test(rust));
+check("rust xor arm carries FINGERPRINT CLASS ONLY doc", /FINGERPRINT CLASS ONLY[^\n]*flag, never content/.test(rust));
+check("rust field comments state repr(C) offsets/aligns", /offset 0, size 8, align 8/.test(rust));
+check("rust varlen String becomes StrRef (u32 offset, u32 len)", /pub struct StrRef\s*\{[\s\S]*?pub offset: u32,[\s\S]*?pub len: u32/.test(rust));
+check("rust StrRef documented as arena ref, never inline", /external blob arena[\s\S]*?never inline/i.test(rust));
+check("no inline asm in rust emitter", !/__asm__|asm!|asm volatile/.test(rust));
+
+// --- 11. rust lww: tie-break on the @primary field --------------------------
+const lwwType = parseSDL("type LwwRec { rev: Int! @primary tag: Int! @join(lww) }")[0];
+const rustLww = tryEmit(lwwType, "rust");
+check("rust lww compares on @primary field", /if self\.rev >= other\.rev \{ self\.tag \} else \{ other\.tag \}/.test(rustLww));
+check("rust lww arm documents tie-break field", /tie-broken by @primary/.test(rustLww));
+
+// --- 12. @packed(bits=N): LSB-first u64 words in layout() -------------------
+const packedSDL = `type PackedRec {
+  a: Int! @packed(bits=48)
+  b: Int! @packed(bits=32)
+  c: Int! @packed(bits=4)
+  tail: Float!
+}`;
+const packedType = parseSDL(packedSDL)[0];
+check("packed bits=N parsed", packedType.fields[0].packed === 48);
+check("unpacked field has no bits", packedType.fields[3].packed === null);
+const PL = layout(packedType);
+const pf = Object.fromEntries(PL.fields.map(x => [x.name, x]));
+check("layout reports bit_offset/bit_width", pf.a.bit_offset === 0 && pf.a.bit_width === 48);
+check("LSB-first: consecutive packed fields stack", pf.b.bit_offset === 0 && pf.c.bit_offset === 32);
+check("packed run spills into next u64 word", pf.b.offset === pf.a.offset + 8);
+check("fields in same word share its byte offset", pf.b.offset === pf.c.offset);
+check("packed storage is u64 words", pf.a.ctype === "u64" && pf.a.size === 8);
+check("unpacked after packed run: next natural-aligned offset", pf.tail.offset === pf.a.offset + 16 && pf.tail.offset % 4 === 0);
+check("struct size rounds to max align", PL.size === 24);
+
+// --- 13. packed get/set masks rendered in zig/c/rust ------------------------
+const pzig = tryEmit(packedType, "zig");
+check("zig emits u64 word storage", /word0: u64/.test(pzig) && /word1: u64/.test(pzig));
+check("zig getter mask LSB-first", /get_a[\s\S]*?\(self\.word0 >> 0\) & 0xffffffffffff/.test(pzig));
+check("zig setter clears keep-mask then ors", /set_c[\s\S]*?\(self\.word1 & 0xffffff0fffffffff\) \| \(\(v & 0xf\) << 32\)/.test(pzig));
+const pc = tryEmit(packedType, "c");
+check("c emits u64 word storage", /uint64_t word0/.test(pc));
+check("c getter renders mask", /PackedRec_get_a[\s\S]*?>> 0\) & 0xffffffffffffull/.test(pc));
+check("c setter renders keep-mask", /PackedRec_set_c[\s\S]*?& 0xffffff0fffffffffull/.test(pc));
+const prust = tryEmit(packedType, "rust");
+check("rust emits u64 word storage", /pub word0: u64/.test(prust));
+check("rust getter renders mask", /fn get_a\(&self\) -> u64[\s\S]*?\(self\.word0 >> 0\) & 0xffffffffffff/.test(prust));
+check("rust setter renders keep-mask", /fn set_c\(&mut self, v: u64\)[\s\S]*?\(self\.word1 & 0xffffff0fffffffff\) \| \(\(v & 0xf\) << 32\)/.test(prust));
+
+// --- 14. receipt parity: one canonical layout hash across langs -------------
+check("receipt rust == zig for plain schema", receipt(types[0], "rust") === receipt(types[0], "zig"));
+check("receipt parity holds for packed schema across all emitters", receipt(packedType, "zig") === receipt(packedType, "rust") && receipt(packedType, "rust") === receipt(packedType, "c"));
+const bannerZ = /receipt ([0-9a-f]{16})/.exec(tryEmit(types[0], "zig"))[1];
+const bannerR = (/receipt ([0-9a-f]{16})/.exec(tryEmit(types[0], "rust")) || [])[1];
+check("emitters embed identical receipt in banner", bannerZ === bannerR && bannerZ === receipt(types[0], "zig"));
+
 console.log(`\n${n - bad}/${n} checks green`);
 process.exit(bad ? 1 : 0);
